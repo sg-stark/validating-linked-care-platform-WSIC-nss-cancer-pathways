@@ -1,0 +1,391 @@
+/* ============================================================
+RDC COHORT DATA EXTRACTION SCRIPT (WSIC / NWL)
+
+Author: Sunnia Gupta
+
+Purpose:
+This script demonstrates how to extract clinically relevant
+variables for a cohort using
+WSIC (North West London) data tables.
+
+It is intended as a reference to:
+- Help researchers locate key datasets within WSIC
+- Demonstrate how tables can be linked using PATIENT_KEY
+- Reduce duplication of effort in data discovery
+
+Structure:
+Each section is independent and can be run separately.
+
+Key Notes:
+- All joins use PATIENT_KEY
+- Index date = DOR (Date of Referral)
+
+Time windows used:
+- 24 months pre-DOR: baseline clinical history
+- 3 months post-DOR: early outcomes
+
+-- DATA STRUCTURE NOTE:
+-- Many source tables contain event-level (longitudinal) data.
+-- As a result, joins may produce multiple rows per patient.
+-- This is intentional and reflects the underlying data structure.
+``
+
+Disclaimer:
+This is a demonstration script. Researchers should validate
+logic and adapt definitions for their own analyses.
+============================================================ */
+
+
+/* ============================================================
+ORIGINAL RDC COHORT
+Contains:
+- Date of referral (DOR)
+- Patient identifiers (pseudonymised)
+- GP Registration status
+
+Identified using the NHS numbers provided by Chelsea Westminster RDC
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl;
+
+
+/* ============================================================
+SECTION 1: DEMOGRAPHICS
+Source: dim_patient_detail_did
+Purpose:
+Retrieve demographic characteristics linked to cohort
+
+Includes:
+- Sex
+- Date of birth
+- Ethnicity
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN NWL_DID_PROD.der.dim_patient_detail_did dem
+    ON nwl.PATIENT_KEY = dem.patient_key;
+
+
+/* ============================================================
+SECTION 2: LONG-TERM CONDITIONS (LTC)
+Source: fact_ltc_primary_care_unpivot_did
+
+Purpose:
+Pre-derived long-term condition flags.
+Preferred over manual SNOMED extraction.
+
+Filter:
+- latest_flag = TRUE ensures most up-to-date status
+- Conditions recorded prior to DOR
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN (
+    SELECT *
+    FROM NWL_DID_PROD.DER.fact_ltc_primary_care_unpivot_did
+    WHERE latest_flag = TRUE
+) ltc
+    ON nwl.PATIENT_KEY = ltc.patient_key
+    AND ltc.DIAGNOSIS_DATE <= nwl.DOR;
+
+
+/* ============================================================
+SECTION 3: ELECTRONIC FRAILTY INDEX (EFI)
+Source: FACT_EFI_DID
+
+Purpose:
+Retrieve frailty scores over time
+
+Filter:
+- Reporting date prior to DOR
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN NWL_DID_PROD.DER.FACT_EFI_DID efi
+    ON efi.patient_key = nwl.patient_key
+    AND efi.REPORTING_DATE <= nwl.DOR;
+
+
+/* ============================================================
+SECTION 4: CLINICAL OBSERVATIONS (GENERAL)
+Source: fact_compass_observation_did
+
+Purpose:
+Contains SNOMED-coded observations:
+- diagnoses
+- symptoms
+- lab results
+
+Filter:
+- 24 months prior to DOR
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN (
+    SELECT
+        patient_key,
+        core_concept_code,
+        core_concept_description,
+        wd_snomed_code,
+        wd_snomed_term,
+        RESULT_VALUE,
+        RESULT_VALUE_UNITS,
+        clinical_effective_date AS ob_date
+    FROM NWL_did_prod.dwh.fact_compass_observation_did
+    WHERE age_at_event >= 18
+) ob
+    ON ob.patient_key = nwl.patient_key
+    AND ob.ob_date BETWEEN DATEADD(MONTH, -24, nwl.DOR) AND nwl.DOR;
+
+
+/* ============================================================
+SECTION 5: BLOOD TEST RESULTS
+Source: fact_compass_observation_did
+
+Purpose:
+Subset of observations with numeric results (lab tests)
+
+Filter:
+- RESULT_VALUE not null
+- 24 months pre-DOR
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN (
+    SELECT *
+    FROM NWL_did_prod.dwh.fact_compass_observation_did
+    WHERE RESULT_VALUE IS NOT NULL
+      AND age_at_event >= 18
+) ob
+    ON ob.patient_key = nwl.patient_key
+    AND ob.CLINICAL_EFFECTIVE_DATE 
+        BETWEEN DATEADD(MONTH, -24, nwl.DOR) AND nwl.DOR;
+
+
+/* ============================================================
+SECTION 6: NON-CANCER DIAGNOSTIC OBSERVATIONS (POST-DOR)
+Source: fact_compass_observation_did
+
+Purpose:
+Identify diagnoses occurring after referral
+
+Logic:
+- Include SNOMED "disorder"
+- Exclude administrative / procedural terms
+- No numeric result (diagnostic codes only)
+- 0–3 months post-DOR
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN (
+    SELECT *
+    FROM NWL_did_prod.dwh.fact_compass_observation_did
+    WHERE age_at_event >= 18
+      AND CORE_CONCEPT_DESCRIPTION LIKE '%disorder%'
+      AND CORE_CONCEPT_DESCRIPTION NOT LIKE '%situation%'
+      AND CORE_CONCEPT_DESCRIPTION NOT LIKE '%observable entity%'
+      AND CORE_CONCEPT_DESCRIPTION NOT LIKE '%procedure%'
+      AND CORE_CONCEPT_DESCRIPTION NOT LIKE '%finding%'
+      AND RESULT_VALUE IS NULL
+) ob
+    ON ob.patient_key = nwl.patient_key
+    AND ob.CLINICAL_EFFECTIVE_DATE 
+        BETWEEN nwl.DOR AND DATEADD(MONTH, 3, nwl.DOR);
+
+
+/* ============================================================
+SECTION 7: PRESCRIPTIONS (ALL)
+Source: medication_order_did
+
+Purpose:
+All prescriptions issued in primary care
+
+Filter:
+- Adults only
+- 24 months pre-DOR
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN (
+    SELECT *
+    FROM NWL_DID_PROD.DWH.FACT_COMPASS_MEDICATION_ORDER_DID
+    WHERE age_at_event >= 18
+) med
+    ON med.patient_key = nwl.patient_key
+    AND med.CLINICAL_EFFECTIVE_DATE 
+        BETWEEN DATEADD(MONTH, -24, nwl.DOR) AND nwl.DOR;
+
+
+
+/* ============================================================
+SECTION 8: SPECIFIC MEDICATION GROUPS (BNF)
+Purpose:
+Identify clinically relevant drug groups using BNF codes
+
+Examples included:
+- Cardiovascular
+- Gastrointestinal
+- Infection
+- CNS medications
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN (
+    SELECT *
+    FROM NWL_DID_PROD.DWH.FACT_COMPASS_MEDICATION_STATEMENT_DID
+    WHERE AUTHORISATION_TYPE_CONCEPT_CODE = 'acute'
+      AND bnf_reference IN (
+          SELECT bnf_paragraph_code
+          FROM nwl_did_prod.ref.dim_bnf_code
+          WHERE bnf_paragraph_code LIKE '0407%'
+             OR bnf_paragraph_code LIKE '0401%'
+             OR bnf_paragraph_code LIKE '0402%'
+             OR bnf_paragraph_code LIKE '0501%'
+             OR bnf_paragraph_code LIKE '0106%'
+             OR bnf_paragraph_code LIKE '0101%'
+             OR bnf_paragraph_code LIKE '0103%'
+             OR bnf_paragraph_code LIKE '1001%'
+             OR bnf_paragraph_code LIKE '0603%'
+             OR bnf_paragraph_code LIKE '0902%'
+             OR bnf_paragraph_code LIKE '070401%'
+             OR bnf_paragraph_code LIKE '0202%'
+      )
+) med
+    ON med.patient_key = nwl.patient_key
+    AND med.CLINICAL_EFFECTIVE_DATE 
+        BETWEEN DATEADD(MONTH, -24, nwl.DOR) AND nwl.DOR;
+
+
+/* ============================================================
+SECTION 9: ALCOHOL STATUS
+Source:
+Observation table + reference SNOMED codes
+
+Purpose:
+Identify alcohol use indicators
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN (
+    SELECT *
+    FROM NWL_did_prod.dwh.fact_compass_observation_did
+    WHERE WD_SNOMED_CODE IN (
+        SELECT SNOMED_CODE
+        FROM NWL_DID_PROD.REF.DIM_PAT_IND_ALCOHOL_USE_CODE
+    )
+) ob
+    ON ob.patient_key = nwl.patient_key;
+
+
+/* ============================================================
+SECTION 10: SMOKING STATUS
+Source:
+Observation table + SNOMED reference codes
+
+Purpose:
+Identify smoking-related indicators
+
+Filter:
+- Recorded prior to DOR
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN (
+    SELECT *
+    FROM NWL_did_prod.dwh.fact_compass_observation_did
+    WHERE WD_SNOMED_CODE IN (
+        SELECT SNOMED_CODE
+        FROM NWL_DID_PROD.REF.DIM_PAT_IND_SMOKING_STATUS_CODE
+    )
+) ob
+    ON ob.patient_key = nwl.patient_key
+    AND ob.CLINICAL_EFFECTIVE_DATE <= nwl.DOR;
+
+
+/* ============================================================
+SECTION 11: PRIMARY CARE (GP) VISITS
+Source: fact_compass_encounter_did
+
+Purpose:
+Measure healthcare utilisation
+
+Filter:
+- Adults only
+- 24 months pre-DOR
+============================================================ */
+
+SELECT *
+FROM did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+LEFT JOIN (
+    SELECT 
+        patient_key,
+        core_concept_code,
+        NON_CORE_CONCEPT_DESCRIPTION,
+        core_concept_description,
+        clinical_effective_date AS GP_visit_date
+    FROM nwl_did_prod.dwh.fact_compass_encounter_did
+    WHERE age_at_event >= 18
+) en
+    ON en.patient_key = nwl.patient_key
+    AND en.GP_visit_date 
+        BETWEEN DATEADD(MONTH, -24, nwl.DOR) AND nwl.DOR;
+
+
+/* ============================================================
+SECTION 12: CANCER COHORT IDENTIFICATION
+Source:
+Observation table + QOF cluster reference
+
+Purpose:
+Identify cancer diagnoses using SNOMED clusters
+
+Outputs:
+- Earliest diagnosis
+- Latest diagnosis
+============================================================ */
+
+SELECT 
+    nwl.patient_key,
+    nwl.dor,
+    obs.wd_snomed_code,
+    obs.wd_snomed_term,
+    MAX(obs.clinical_effective_date) AS latest_diagnosis_date,
+    MIN(obs.clinical_effective_date) AS earliest_diagnosis_date
+FROM NWL_DID_PROD.DWH.FACT_COMPASS_OBSERVATION_DID obs
+JOIN did_sandbox_rdc.rdc.SG_JG_050424_nwl nwl
+    ON obs.patient_key = nwl.patient_key
+WHERE obs.wd_snomed_code IN (
+    SELECT snomed_code
+    FROM NWL_DID_PROD.REF.DIM_QOF_CLUSTER
+    WHERE cluster_id LIKE '%CAN_COD%'
+)
+GROUP BY 
+    nwl.patient_key,
+    nwl.dor,
+    obs.wd_snomed_code,
+    obs.wd_snomed_term;
+
+
+/* ============================================================
+TABLE SUMMARY (WSIC CORE TABLES)
+
+dim_patient_detail_did        → demographics  
+fact_ltc_primary_care_unpivot → long-term conditions  
+fact_efi_did                 → frailty  
+fact_compass_observation_did → diagnoses, labs, symptoms  
+fact_compass_medication_STATEMENT_DID  → prescribing  
+fact_compass_encounter_did   → GP visits  
+
+These tables form the backbone of most WSIC-based analyses.
+============================================================ */
