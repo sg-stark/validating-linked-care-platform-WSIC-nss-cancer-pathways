@@ -62,7 +62,7 @@ Because the underlying WSIC data and associated data dictionaries are not public
 
 Study population
 
-The study identified patients referred to a Rapid Diagnostic Centre between November 2021 and December 2024.
+The study identified patients referred to a North West London Rapid Diagnostic Centre between November 2021 and December 2024.
 
 Following linkage to WSIC primary-care records, 2,021 patients with available primary-care records were included in the analysis.
 
